@@ -12,6 +12,9 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
+from torchvision.io.video_reader import VideoReader
+from torchvision.transforms import Resize
+from torchvision.transforms import InterpolationMode
 
 
 def get_sdpa_settings():
@@ -101,6 +104,13 @@ def _load_img_as_tensor(img_path, image_size):
     return img, video_height, video_width
 
 
+def _resize_img_tensor(img: torch.Tensor, image_size):
+    video_height, video_width = img.shape[1:]
+    transform = Resize((image_size, image_size), interpolation=InterpolationMode.LANCZOS)
+    img_resized = transform(img) / 255.0
+    return img_resized, video_height, video_width
+
+
 class AsyncVideoFrameLoader:
     """
     A list of video frames to be load asynchronously without blocking session start.
@@ -117,9 +127,15 @@ class AsyncVideoFrameLoader:
     ):
         self.img_paths = img_paths
         self.image_size = image_size
-        self.offload_video_to_cpu = offload_video_to_cpu
+        if offload_video_to_cpu:
+            img_mean = img_mean.cpu()
+            img_std = img_std.cpu()
+        else:
+            img_mean = img_mean.to(compute_device, non_blocking=True)
+            img_std = img_std.to(compute_device, non_blocking=True)
         self.img_mean = img_mean
         self.img_std = img_std
+
         # items in `self.images` will be loaded asynchronously
         self.images = [None] * len(img_paths)
         # catch and raise any exceptions in the async loading thread
@@ -127,7 +143,6 @@ class AsyncVideoFrameLoader:
         # video_height and video_width be filled when loading the first image
         self.video_height = None
         self.video_width = None
-        self.compute_device = compute_device
 
         # load the first frame to fill video_height and video_width and also
         # to cache it (since it's most likely where the user will click)
@@ -158,15 +173,80 @@ class AsyncVideoFrameLoader:
         self.video_height = video_height
         self.video_width = video_width
         # normalize by mean and std
+        img = img.to(self.img_mean.device, non_blocking=True)
         img -= self.img_mean
         img /= self.img_std
-        if not self.offload_video_to_cpu:
-            img = img.to(self.compute_device, non_blocking=True)
         self.images[index] = img
         return img
 
     def __len__(self):
         return len(self.images)
+
+
+class SyncedVideoStreamLoader:
+    """
+    A list of video frames to be load asynchronously without blocking session start.
+    """
+
+    def __init__(self, video_path, image_size, offload_video_to_cpu, img_mean, img_std, compute_device):
+        self.video_path = video_path
+        self.image_size = image_size
+        if offload_video_to_cpu:
+            img_mean = img_mean.cpu()
+            img_std = img_std.cpu()
+        else:
+            img_mean = img_mean.to(compute_device, non_blocking=True)
+            img_std = img_std.to(compute_device, non_blocking=True)
+        self.img_mean = img_mean
+        self.img_std = img_std
+
+        # video_height and video_width be filled when loading the first image
+        self.video_height = None
+        self.video_width = None
+
+        self.video_stream = VideoReader(video_path, stream="video")
+
+        self.video_data = self.video_stream.get_metadata()['video']
+        if "fps" in self.video_data:
+            self.video_fps = self.video_data['fps'][0]
+        else:
+            self.video_fps = self.video_data["framerate"][0]
+
+        self.video_len = int(self.video_data['duration'][0] * self.video_fps)
+
+        # load the first frame to fill video_height and video_width and also
+        # to cache it (since it's most likely where the user will click)
+        self.index = -1
+        self.__getitem__(0)
+
+    def __getitem__(self, index):
+        if self.index + 1 == index:
+            img_dict = self.video_stream.__next__()
+        else:
+            timestamp = index / self.video_fps
+            self.video_stream = self.video_stream.seek(timestamp)
+            img_dict = self.video_stream.__next__()
+            # Seek to the correct frame
+            while abs(timestamp - img_dict['pts']) > (1 / self.video_fps):
+                img_dict = self.video_stream.__next__()
+
+        self.index = index
+
+        img = img_dict['data']
+        img, video_height, video_width = _resize_img_tensor(
+            img_dict['data'], self.image_size
+        )
+        self.video_height = video_height
+        self.video_width = video_width
+        # normalize by mean and std
+        img = img.to(self.img_mean.device, non_blocking=True)
+        img -= self.img_mean
+        img /= self.img_std
+        # self.images[index] = img
+        return img
+
+    def __len__(self):
+        return self.video_len
 
 
 def load_video_frames(
@@ -229,52 +309,61 @@ def load_video_frames_from_jpg_images(
     """
     if isinstance(video_path, str) and os.path.isdir(video_path):
         jpg_folder = video_path
-    else:
-        raise NotImplementedError(
-            "Only JPEG frames are supported at this moment. For video files, you may use "
-            "ffmpeg (https://ffmpeg.org/) to extract frames into a folder of JPEG files, such as \n"
-            "```\n"
-            "ffmpeg -i <your_video>.mp4 -q:v 2 -start_number 0 <output_dir>/'%05d.jpg'\n"
-            "```\n"
-            "where `-q:v` generates high-quality JPEG frames and `-start_number 0` asks "
-            "ffmpeg to start the JPEG file from 00000.jpg."
-        )
+        frame_names = [
+            p
+            for p in os.listdir(jpg_folder)
+            if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+        ]
+        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+        num_frames = len(frame_names)
+        if num_frames == 0:
+            raise RuntimeError(f"no images found in {jpg_folder}")
+        img_paths = [os.path.join(jpg_folder, frame_name) for frame_name in frame_names]
+        img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+        img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
 
-    frame_names = [
-        p
-        for p in os.listdir(jpg_folder)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-    ]
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-    num_frames = len(frame_names)
-    if num_frames == 0:
-        raise RuntimeError(f"no images found in {jpg_folder}")
-    img_paths = [os.path.join(jpg_folder, frame_name) for frame_name in frame_names]
-    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
-    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+        if async_loading_frames:
+            lazy_images = AsyncVideoFrameLoader(
+                img_paths,
+                image_size,
+                offload_video_to_cpu,
+                img_mean,
+                img_std,
+                compute_device,
+            )
+            return lazy_images, lazy_images.video_height, lazy_images.video_width
 
-    if async_loading_frames:
-        lazy_images = AsyncVideoFrameLoader(
-            img_paths,
-            image_size,
-            offload_video_to_cpu,
-            img_mean,
-            img_std,
-            compute_device,
+        images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+        for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
+            images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
+        if not offload_video_to_cpu:
+            images = images.to(compute_device)
+            img_mean = img_mean.to(compute_device)
+            img_std = img_std.to(compute_device)
+        # normalize by mean and std
+        images -= img_mean
+        images /= img_std
+        return images, video_height, video_width
+
+    elif isinstance(video_path, str) and os.path.isfile(video_path) and os.path.splitext(video_path)[1] in [".mp4", ".avi", ".mov"]:
+        img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+        img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+        lazy_images = SyncedVideoStreamLoader(
+            video_path, image_size, offload_video_to_cpu, img_mean, img_std, compute_device
         )
         return lazy_images, lazy_images.video_height, lazy_images.video_width
+    
+    else:
+            raise NotImplementedError(
+                "Only JPEG frames are supported at this moment. For video files, you may use "
+                "ffmpeg (https://ffmpeg.org/) to extract frames into a folder of JPEG files, such as \n"
+                "```\n"
+                "ffmpeg -i <your_video>.mp4 -q:v 2 -start_number 0 <output_dir>/'%05d.jpg'\n"
+                "```\n"
+                "where `-q:v` generates high-quality JPEG frames and `-start_number 0` asks "
+                "ffmpeg to start the JPEG file from 00000.jpg."
+            )
 
-    images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
-    for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
-        images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
-    if not offload_video_to_cpu:
-        images = images.to(compute_device)
-        img_mean = img_mean.to(compute_device)
-        img_std = img_std.to(compute_device)
-    # normalize by mean and std
-    images -= img_mean
-    images /= img_std
-    return images, video_height, video_width
 
 
 def load_video_frames_from_video_file(

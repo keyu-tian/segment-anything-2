@@ -29,6 +29,7 @@ REQUIRED_PACKAGES = [
     "hydra-core>=1.3.2",
     "iopath>=0.1.10",
     "pillow>=9.4.0",
+    "av==11.0.0"
 ]
 
 EXTRA_PACKAGES = {
@@ -164,7 +165,7 @@ setup(
     author=AUTHOR,
     author_email=AUTHOR_EMAIL,
     license=LICENSE,
-    packages=find_packages(exclude="notebooks"),
+    packages=['sam2.csrc'],# find_packages(exclude="notebooks"),
     include_package_data=True,
     install_requires=REQUIRED_PACKAGES,
     extras_require=EXTRA_PACKAGES,
